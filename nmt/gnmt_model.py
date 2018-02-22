@@ -65,9 +65,12 @@ class GNMTModel(attention_model.AttentionModel):
     if hparams.encoder_type != "gnmt":
       raise ValueError("Unknown encoder_type %s" % hparams.encoder_type)
 
+    utils.print_out("  self.num_encoder_layers = %d" % self.num_encoder_layers)
+
     # Build GNMT encoder.
     num_bi_layers = 1
     num_uni_layers = self.num_encoder_layers - num_bi_layers
+
     utils.print_out("  num_bi_layers = %d" % num_bi_layers)
     utils.print_out("  num_uni_layers = %d" % num_uni_layers)
 
@@ -96,6 +99,8 @@ class GNMTModel(attention_model.AttentionModel):
           num_bi_layers=num_bi_layers,
           num_bi_residual_layers=0,  # no residual connection
       )
+
+      ## TODO: sequence_length
 
       if 'cudnn' in hparams.unit_type:
         assert hparams.unit_type == 'cudnnlstm'

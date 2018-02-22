@@ -645,58 +645,105 @@ class Model(BaseModel):
       # EVAL/INFER mode ==> is_training = False
       is_training = (self.mode == tf.contrib.learn.ModeKeys.TRAIN)
 
-      ## TODO: residual layers
-      ## TODO: multi gpu
-
       # dropout (= 1 - keep_prob) is set to 0 during eval and infer
       dropout = hparams.dropout if self.mode == tf.contrib.learn.ModeKeys.TRAIN else 0.0
 
-      cudnn_cell = cudnn_rnn.CudnnLSTM(num_layers=num_bi_layers,
-                                       num_units=hparams.num_units,
-                                       direction=cudnn_rnn.CUDNN_RNN_BIDIRECTION,
-                                       input_mode=cudnn_rnn.CUDNN_INPUT_LINEAR_MODE,
-                                       dropout=dropout,  # NOTE: dropout might be broken in CudnnLSTM class
-                                       dtype=tf.float32)
+      print('num_bi_residual_layers', num_bi_residual_layers)
 
       '''
-      # Dropout (= 1 - keep_prob)
-      if dropout > 0.0:
-        single_cell = tf.contrib.rnn.DropoutWrapper(
-            cell=single_cell, input_keep_prob=(1.0 - dropout))
-        utils.print_out("  %s, dropout=%g " %(type(single_cell).__name__, dropout),
-                        new_line=False)
+      if num_bi_layers == 1:
+        cudnn_cell = cudnn_rnn.CudnnLSTM(num_layers=1,
+                                         num_units=hparams.num_units,
+                                         direction=cudnn_rnn.CUDNN_RNN_BIDIRECTION,
+                                         input_mode=cudnn_rnn.CUDNN_INPUT_LINEAR_MODE,
+                                         dropout=dropout,  # NOTE: dropout might be broken in CudnnLSTM class
+                                         dtype=tf.float32)
 
-      # Residual
-      if residual_connection:
-        single_cell = tf.contrib.rnn.ResidualWrapper(
-            single_cell, residual_fn=residual_fn)
-        utils.print_out("  %s" % type(single_cell).__name__, new_line=False)
+        outputs, (h, c) = cudnn_cell(
+            inputs=inputs, # 3-D tensor [time_len, batch_size, input_size]
+            training=is_training
+        )
 
-      # Device Wrapper
-      if device_str:
-        single_cell = tf.contrib.rnn.DeviceWrapper(single_cell, device_str)
-        utils.print_out("  %s, device=%s" %
-                        (type(single_cell).__name__, device_str), new_line=False)
+        h0, h1 = tf.unstack(h)
+        c0, c1 = tf.unstack(c)
+
+        return outputs, (tf.contrib.rnn.LSTMStateTuple(c=c0, h=h0), tf.contrib.rnn.LSTMStateTuple(c=c1, h=h1))
+      else:
       '''
 
-      # Dropout (= 1 - keep_prob)
-      '''
-      if dropout > 0.0:
-        cudnn_cell = tf.contrib.rnn.DropoutWrapper(
-            cell=cudnn_cell, input_keep_prob=(1.0 - dropout))
-        utils.print_out("  %s, dropout=%g " %(type(cudnn_cell).__name__, dropout),
-                        new_line=False)
-      '''
+      layer_out = inputs # 3-D tensor [time_len, batch_size, input_size]
+      bi_state = None
 
-      outputs, (h, c) = cudnn_cell(
-          inputs=inputs, # 3-D tensor [time_len, batch_size, input_size]
-          training=is_training
-      )
+      for i in range(num_bi_layers):
+        with tf.variable_scope("CudnnBiLSTM_layer%02d" % (i+1)):
+          original_input = layer_out
+          # TODO: apply input dropout if CudnnLSTM isn't already
+          fw_device_str = model_helper.get_device_str(i + base_gpu, hparams.num_gpus)
+          with tf.device(fw_device_str):
+            print('%d fw place:' % i, fw_device_str)
+            cudnn_cell_fw = cudnn_rnn.CudnnLSTM(num_layers=1,
+                                                 num_units=hparams.num_units,
+                                                 direction=cudnn_rnn.CUDNN_RNN_UNIDIRECTION,
+                                                 input_mode=cudnn_rnn.CUDNN_INPUT_LINEAR_MODE,
+                                                 name="CudnnBiLSTM_FW",
+                                                 dropout=dropout,  # NOTE: dropout might be broken in CudnnLSTM class
+                                                 dtype=tf.float32)
 
-      h0, h1 = tf.unstack(h)
-      c0, c1 = tf.unstack(c)
+            outputs_fw, (h_fw, c_fw) = cudnn_cell_fw(
+                inputs=layer_out, # 3-D tensor [time_len, batch_size, input_size]
+                training=is_training
+            )
 
-      return outputs, (tf.contrib.rnn.LSTMStateTuple(c=c0, h=h0), tf.contrib.rnn.LSTMStateTuple(c=c1, h=h1))
+
+          # Reverse input for backward RNN
+          inputs_rev = tf.reverse_sequence(input=layer_out, seq_lengths=sequence_length,
+                                           seq_axis=0, batch_axis=1, name="inputs_reversed")
+
+
+          bw_device_str = model_helper.get_device_str(i + (base_gpu + num_bi_layers), hparams.num_gpus)
+          with tf.device(bw_device_str):
+            print('%d bw place:' % i, bw_device_str)
+            cudnn_cell_bw = cudnn_rnn.CudnnLSTM(num_layers=1,
+                                                 num_units=hparams.num_units,
+                                                 direction=cudnn_rnn.CUDNN_RNN_UNIDIRECTION,
+                                                 input_mode=cudnn_rnn.CUDNN_INPUT_LINEAR_MODE,
+                                                 name="CudnnBiLSTM_BW",
+                                                 dropout=dropout,  # NOTE: dropout might be broken in CudnnLSTM class
+                                                 dtype=tf.float32)
+
+            outputs_bw_rev, (h_bw, c_bw) = cudnn_cell_bw(
+                inputs=inputs_rev,
+                training=is_training
+            )
+
+          # Reverse the output back
+          outputs_bw = tf.reverse_sequence(input=outputs_bw_rev, seq_lengths=sequence_length,
+                                           seq_axis=0, batch_axis=1, name="backward_rnn_output")
+
+          # TODO: need to reverse h_bw, c_bw??? probably not
+          # Add forward and backward outputs.
+          layer_out = tf.add(outputs_fw, outputs_bw)
+
+          ## TODO: add dropout at output if desired
+
+          h0, h1 = tf.unstack(h_fw)[0], tf.unstack(h_bw)[0]
+          c0, c1 = tf.unstack(c_fw)[0], tf.unstack(c_bw)[0]
+
+          bi_state = (tf.contrib.rnn.LSTMStateTuple(c=c0, h=h0), tf.contrib.rnn.LSTMStateTuple(c=c1, h=h1))
+
+          if(i >= num_bi_layers - num_bi_residual_layers):
+            # use residual
+            layer_out = tf.add(layer_out, original_input)
+
+
+      print('***************** sequence_length', sequence_length)
+      # (this is masked out in loss anyways)
+      # Mask out paddings. (TODO: check code)
+      # mask = tf.sequence_mask(sequence_length, dtype=tf.float32)
+      # mask = tf.transpose(mask)
+      # mask = tf.expand_dims(mask, axis=2)
+      # layer_out = tf.multiply(layer_out, mask)
+      return layer_out, bi_state
     else:
       #   Construct forward and backward cells
       fw_cell = self._build_encoder_cell(hparams,
