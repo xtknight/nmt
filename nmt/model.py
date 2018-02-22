@@ -641,51 +641,57 @@ class Model(BaseModel):
       assert hparams.unit_type == 'cudnnlstm'
       assert hparams.time_major == True
 
-      ## TODO: ensure time major
+      # TRAIN mode ==> is_training = True
+      # EVAL/INFER mode ==> is_training = False
+      is_training = (self.mode == tf.contrib.learn.ModeKeys.TRAIN)
+
       ## TODO: residual layers
       ## TODO: multi gpu
-      ## TODO: is_training
+
+      # dropout (= 1 - keep_prob) is set to 0 during eval and infer
+      dropout = hparams.dropout if self.mode == tf.contrib.learn.ModeKeys.TRAIN else 0.0
 
       cudnn_cell = cudnn_rnn.CudnnLSTM(num_layers=num_bi_layers,
                                        num_units=hparams.num_units,
                                        direction=cudnn_rnn.CUDNN_RNN_BIDIRECTION,
                                        input_mode=cudnn_rnn.CUDNN_INPUT_LINEAR_MODE,
-                                       #input_size=hparams.num_units,
+                                       dropout=dropout,  # NOTE: dropout might be broken in CudnnLSTM class
                                        dtype=tf.float32)
 
-      ## TODO: fix scopes?
-      #self.init_h = tf.get_variable('h', dtype=tf.float32, initializer=tf.zeros([2*num_bi_layers, hparams.batch_size, hparams.num_units]))
-      #self.init_c = tf.get_variable('c', dtype=tf.float32, initializer=tf.zeros([2*num_bi_layers, hparams.batch_size, hparams.num_units]))
+      '''
+      # Dropout (= 1 - keep_prob)
+      if dropout > 0.0:
+        single_cell = tf.contrib.rnn.DropoutWrapper(
+            cell=single_cell, input_keep_prob=(1.0 - dropout))
+        utils.print_out("  %s, dropout=%g " %(type(single_cell).__name__, dropout),
+                        new_line=False)
 
-      # FIXME: tweak init_scale
-      #params_size_t = cudnn_cell.params_size()
+      # Residual
+      if residual_connection:
+        single_cell = tf.contrib.rnn.ResidualWrapper(
+            single_cell, residual_fn=residual_fn)
+        utils.print_out("  %s" % type(single_cell).__name__, new_line=False)
 
-      #cudnn_params = tf.get_variable('lstm_params',
-      #         initializer=tf.random_uniform([params_size_t], -0.04, 0.04), validate_shape=False)
+      # Device Wrapper
+      if device_str:
+        single_cell = tf.contrib.rnn.DeviceWrapper(single_cell, device_str)
+        utils.print_out("  %s, device=%s" %
+                        (type(single_cell).__name__, device_str), new_line=False)
+      '''
 
-      print('inputs', inputs)
+      # Dropout (= 1 - keep_prob)
+      '''
+      if dropout > 0.0:
+        cudnn_cell = tf.contrib.rnn.DropoutWrapper(
+            cell=cudnn_cell, input_keep_prob=(1.0 - dropout))
+        utils.print_out("  %s, dropout=%g " %(type(cudnn_cell).__name__, dropout),
+                        new_line=False)
+      '''
 
-      print('cudnn cell 1')
       outputs, (h, c) = cudnn_cell(
-          inputs=inputs # 3-D tensor [time_len, batch_size, input_size],
-          #initial_state=(self.init_h, self.init_c),
-          #input_h=self.init_h,
-          #input_c=self.init_c#,
-          #params=cudnn_params #,
-          #is_training=is_training
+          inputs=inputs, # 3-D tensor [time_len, batch_size, input_size]
+          training=is_training
       )
-      print('cudnn cell 2')
-
-      print('cudnnlstm state h', h)
-      print('cudnnlstm state c', c)
-
-      #return tf.concat(outputs, -1), (h, c)
-      #cudnnlstm state h Tensor("dynamic_seq2seq/encoder/cudnn_lstm/CudnnRNN:1", shape=(2, ?, 1024), dtype=float32)
-      #cudnnlstm state c Tensor("dynamic_seq2seq/encoder/cudnn_lstm/CudnnRNN:2", shape=(2, ?, 1024), dtype=float32)
-      #LSTMStateTuple(c=c[0], h=h[0]), LSTMStateTuple(c=c[1], h=h[1])
-
-      print('unstack h', tf.unstack(h))
-      print('unstack c', tf.unstack(c))
 
       h0, h1 = tf.unstack(h)
       c0, c1 = tf.unstack(c)
@@ -710,8 +716,6 @@ class Model(BaseModel):
           sequence_length=sequence_length,
           time_major=self.time_major,
           swap_memory=True)
-
-      print('normal state', bi_state)
 
       return tf.concat(bi_outputs, -1), bi_state
 

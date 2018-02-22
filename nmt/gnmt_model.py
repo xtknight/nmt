@@ -97,79 +97,41 @@ class GNMTModel(attention_model.AttentionModel):
           num_bi_residual_layers=0,  # no residual connection
       )
 
-      print('....1')
-
       if 'cudnn' in hparams.unit_type:
         assert hparams.unit_type == 'cudnnlstm'
 
-        ## TODO: dropout
+        # TRAIN mode ==> is_training = True
+        # EVAL/INFER mode ==> is_training = False
+        is_training = (self.mode == tf.contrib.learn.ModeKeys.TRAIN)
+
+        # dropout (= 1 - keep_prob) is set to 0 during eval and infer
+        dropout = hparams.dropout if self.mode == tf.contrib.learn.ModeKeys.TRAIN else 0.0
 
         cudnn_cell = cudnn_rnn.CudnnLSTM(num_layers=num_uni_layers,
                                          num_units=hparams.num_units,
                                          direction=cudnn_rnn.CUDNN_RNN_UNIDIRECTION,
                                          input_mode=cudnn_rnn.CUDNN_INPUT_LINEAR_MODE,
-                                         #input_size=hparams.num_units,
+                                         dropout=dropout,  # NOTE: dropout might be broken in CudnnLSTM class
                                          dtype=tf.float32)
 
-        '''
-        uni_cell = model_helper.create_rnn_cell(
-                    unit_type=hparams.unit_type,
-                    num_units=hparams.num_units,
-                    num_layers=num_uni_layers,
-                    num_residual_layers=self.num_encoder_residual_layers,
-                    forget_bias=hparams.forget_bias,
-                    dropout=hparams.dropout,
-                    num_gpus=self.num_gpus,
-                    base_gpu=1,
-                    mode=self.mode,
-                    single_cell_fn=self.single_cell_fn)
-        '''
-
-        print('....2')
-
-        print('gnmt cudnn cell 1')
         encoder_outputs, (h, c) = cudnn_cell(
-            inputs=bi_encoder_outputs # 3-D tensor [time_len, batch_size, input_size],
-            #initial_state=(self.init_h, self.init_c),
-            #input_h=self.init_h,
-            #input_c=self.init_c#,
-            #params=cudnn_params #,
-            #is_training=is_training
+            inputs=bi_encoder_outputs, # 3-D tensor [time_len, batch_size, input_size]
+            training=is_training
         )
-        print('gnmt cudnn cell 2')
-        print('gnmt h', h)
-        print('gnmt c', c)
 
         h0 = tf.unstack(h)[0]
         c0 = tf.unstack(c)[0]
+
+        # encoder_outputs: size [max_time, batch_size, num_units]
+        #   when time_major = True
 
         encoder_state = tf.contrib.rnn.LSTMStateTuple(c=c0, h=h0)
 
         encoder_state = (bi_encoder_state[1],) + (
             (encoder_state,) if num_uni_layers == 1 else encoder_state)
-
-        # encoder_outputs: size [max_time, batch_size, num_units]
-        #   when time_major = True
-
-        '''
-        encoder_outputs, encoder_state = tf.nn.dynamic_rnn(
-            uni_cell,
-            bi_encoder_outputs,
-            dtype=dtype,
-            sequence_length=iterator.source_sequence_length,
-            time_major=self.time_major)
-
-        print('....3')
-
-        # Pass all encoder state except the first bi-directional layer's state to
-        # decoder.
-        encoder_state = (bi_encoder_state[1],) + (
-            (encoder_state,) if num_uni_layers == 1 else encoder_state)
-        '''
       else:
         uni_cell = model_helper.create_rnn_cell(
             unit_type=hparams.unit_type,
-  #          unit_type="lstm",
             num_units=hparams.num_units,
             num_layers=num_uni_layers,
             num_residual_layers=self.num_encoder_residual_layers,
@@ -180,8 +142,6 @@ class GNMTModel(attention_model.AttentionModel):
             mode=self.mode,
             single_cell_fn=self.single_cell_fn)
 
-        print('....2')
-
         # encoder_outputs: size [max_time, batch_size, num_units]
         #   when time_major = True
         encoder_outputs, encoder_state = tf.nn.dynamic_rnn(
@@ -190,9 +150,6 @@ class GNMTModel(attention_model.AttentionModel):
             dtype=dtype,
             sequence_length=iterator.source_sequence_length,
             time_major=self.time_major)
-
-        print('normal lstm encoder_state', encoder_state)
-        print('....3')
 
         # Pass all encoder state except the first bi-directional layer's state to
         # decoder.
