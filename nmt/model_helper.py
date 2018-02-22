@@ -10,6 +10,7 @@ import numpy as np
 import tensorflow as tf
 
 from tensorflow.python.ops import lookup_ops
+from tensorflow.contrib.cudnn_rnn.python.layers import cudnn_rnn
 
 from .utils import iterator_utils
 from .utils import misc_utils as utils
@@ -21,7 +22,7 @@ __all__ = [
     "create_eval_model", "create_infer_model",
     "create_emb_for_encoder_and_decoder", "create_rnn_cell", "gradient_clip",
     "create_or_load_model", "load_model", "avg_checkpoints",
-    "compute_perplexity"
+    "compute_perplexity", "create_cudnn_rnn"
 ]
 
 # If a vocab size is greater than this value, put the embedding on cpu instead
@@ -427,6 +428,120 @@ def _cell_list(unit_type, num_units, num_layers, num_residual_layers,
 
   return cell_list
 
+
+def create_cudnn_rnn(unit_type, num_units, num_layers, num_residual_layers,
+                        forget_bias, dropout, mode, num_gpus, base_gpu=0, sequence_length=None, bidirectional=False, inputs=None):
+  """Create multi-layer Cudnn RNN.
+
+  Args:
+    unit_type: string representing the unit type, i.e. "lstm".
+    num_units: the depth of each unit.
+    num_layers: number of cells.
+    num_residual_layers: Number of residual layers from top to bottom. For
+      example, if `num_layers=4` and `num_residual_layers=2`, the last 2 RNN
+      layers will be considered residual.
+    forget_bias: the initial forget bias of the RNNCell(s).
+    dropout: floating point value between 0.0 and 1.0:
+      the probability of dropout.  this is ignored if `mode != TRAIN`.
+    mode: either tf.contrib.learn.TRAIN/EVAL/INFER
+    num_gpus: The number of gpus to use when performing round-robin
+      placement of layers.
+    base_gpu: The gpu device id to use for the first RNN cell in the
+      returned list. The i-th RNN cell will use `(base_gpu + i) % num_gpus`
+      as its device id.
+  Returns:
+    Tuple (outputs, states)  [same as tf.nn.bidirectional_dynamic_rnn or dynamic_rnn format]
+  """
+  assert unit_type == 'cudnnlstm'
+
+  ## TODO: forget_bias
+
+  layer_out = inputs # 3-D tensor [time_len, batch_size, input_size]
+  state = None
+
+  # TRAIN mode ==> is_training = True
+  # EVAL/INFER mode ==> is_training = False
+  is_training = (mode == tf.contrib.learn.ModeKeys.TRAIN)
+
+  # dropout (= 1 - keep_prob) is set to 0 during eval and infer
+  dropout = dropout if mode == tf.contrib.learn.ModeKeys.TRAIN else 0.0
+
+  for i in range(num_layers):
+    with tf.variable_scope("CudnnLSTM_layer%02d" % (i+1)):
+      original_input = layer_out
+      # TODO: apply input dropout if CudnnLSTM isn't already
+      fw_device_str = get_device_str(i + base_gpu, num_gpus)
+      with tf.device(fw_device_str):
+        print('%d fw place:' % i, fw_device_str)
+        cudnn_cell_fw = cudnn_rnn.CudnnLSTM(num_layers=1,
+                                             num_units=num_units,
+                                             direction=cudnn_rnn.CUDNN_RNN_UNIDIRECTION,
+                                             input_mode=cudnn_rnn.CUDNN_INPUT_LINEAR_MODE,
+                                             name="CudnnLSTM_FW",
+                                             dropout=dropout,  # NOTE: dropout might be broken in CudnnLSTM class
+                                             dtype=tf.float32)
+
+        outputs_fw, (h_fw, c_fw) = cudnn_cell_fw(
+            inputs=layer_out, # 3-D tensor [time_len, batch_size, input_size]
+            training=is_training
+        )
+
+
+      if bidirectional:
+        # Reverse input for backward RNN
+        inputs_rev = tf.reverse_sequence(input=layer_out, seq_lengths=sequence_length,
+                                         seq_axis=0, batch_axis=1, name="inputs_reversed")
+
+
+        bw_device_str = get_device_str(i + (base_gpu + num_layers), num_gpus)
+        with tf.device(bw_device_str):
+          print('%d bw place:' % i, bw_device_str)
+          cudnn_cell_bw = cudnn_rnn.CudnnLSTM(num_layers=1,
+                                               num_units=num_units,
+                                               direction=cudnn_rnn.CUDNN_RNN_UNIDIRECTION,
+                                               input_mode=cudnn_rnn.CUDNN_INPUT_LINEAR_MODE,
+                                               name="CudnnLSTM_BW",
+                                               dropout=dropout,  # NOTE: dropout might be broken in CudnnLSTM class
+                                               dtype=tf.float32)
+
+          outputs_bw_rev, (h_bw, c_bw) = cudnn_cell_bw(
+              inputs=inputs_rev,
+              training=is_training
+          )
+
+        # Reverse the output back
+        outputs_bw = tf.reverse_sequence(input=outputs_bw_rev, seq_lengths=sequence_length,
+                                         seq_axis=0, batch_axis=1, name="backward_rnn_output")
+
+        # TODO: need to reverse h_bw, c_bw??? probably not
+        # Add forward and backward outputs.
+        layer_out = tf.add(outputs_fw, outputs_bw)
+
+        ## TODO: add dropout at output if desired
+
+        h0, h1 = tf.unstack(h_fw)[0], tf.unstack(h_bw)[0]
+        c0, c1 = tf.unstack(c_fw)[0], tf.unstack(c_bw)[0]
+
+        state = (tf.contrib.rnn.LSTMStateTuple(c=c0, h=h0), tf.contrib.rnn.LSTMStateTuple(c=c1, h=h1))
+      else:
+        layer_out = outputs_fw
+        h0 = tf.unstack(h_fw)[0]
+        c0 = tf.unstack(c_fw)[0]
+        state = tf.contrib.rnn.LSTMStateTuple(c=c0, h=h0)
+
+      if(i >= num_layers - num_residual_layers):
+        # use residual
+        print('... layer %d is residual' % i)
+        layer_out = tf.add(layer_out, original_input)
+
+  print('***************** sequence_length', sequence_length)
+  # (this is masked out in loss anyways)
+  # Mask out paddings. (TODO: check code)
+  # mask = tf.sequence_mask(sequence_length, dtype=tf.float32)
+  # mask = tf.transpose(mask)
+  # mask = tf.expand_dims(mask, axis=2)
+  # layer_out = tf.multiply(layer_out, mask)
+  return layer_out, state
 
 def create_rnn_cell(unit_type, num_units, num_layers, num_residual_layers,
                     forget_bias, dropout, mode, num_gpus, base_gpu=0,

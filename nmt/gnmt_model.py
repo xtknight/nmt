@@ -90,47 +90,24 @@ class GNMTModel(attention_model.AttentionModel):
       encoder_emb_inp = tf.nn.embedding_lookup(self.embedding_encoder,
                                                source)
 
-      # Execute _build_bidirectional_rnn from Model class
-      bi_encoder_outputs, bi_encoder_state = self._build_bidirectional_rnn(
-          inputs=encoder_emb_inp,
-          sequence_length=iterator.source_sequence_length,
-          dtype=dtype,
-          hparams=hparams,
-          num_bi_layers=num_bi_layers,
-          num_bi_residual_layers=0,  # no residual connection
-      )
-
-      ## TODO: sequence_length
+      with tf.variable_scope("encoder-cudnnbilstm") as scope2:
+        # Execute _build_bidirectional_rnn from Model class
+        bi_encoder_outputs, bi_encoder_state = self._build_bidirectional_rnn(
+            inputs=encoder_emb_inp,
+            sequence_length=iterator.source_sequence_length,
+            dtype=dtype,
+            hparams=hparams,
+            num_bi_layers=num_bi_layers,
+            num_bi_residual_layers=0,  # no residual connection
+        )
 
       if 'cudnn' in hparams.unit_type:
         assert hparams.unit_type == 'cudnnlstm'
+        assert hparams.time_major == True
 
-        # TRAIN mode ==> is_training = True
-        # EVAL/INFER mode ==> is_training = False
-        is_training = (self.mode == tf.contrib.learn.ModeKeys.TRAIN)
-
-        # dropout (= 1 - keep_prob) is set to 0 during eval and infer
-        dropout = hparams.dropout if self.mode == tf.contrib.learn.ModeKeys.TRAIN else 0.0
-
-        cudnn_cell = cudnn_rnn.CudnnLSTM(num_layers=num_uni_layers,
-                                         num_units=hparams.num_units,
-                                         direction=cudnn_rnn.CUDNN_RNN_UNIDIRECTION,
-                                         input_mode=cudnn_rnn.CUDNN_INPUT_LINEAR_MODE,
-                                         dropout=dropout,  # NOTE: dropout might be broken in CudnnLSTM class
-                                         dtype=tf.float32)
-
-        encoder_outputs, (h, c) = cudnn_cell(
-            inputs=bi_encoder_outputs, # 3-D tensor [time_len, batch_size, input_size]
-            training=is_training
-        )
-
-        h0 = tf.unstack(h)[0]
-        c0 = tf.unstack(c)[0]
-
-        # encoder_outputs: size [max_time, batch_size, num_units]
-        #   when time_major = True
-
-        encoder_state = tf.contrib.rnn.LSTMStateTuple(c=c0, h=h0)
+        encoder_outputs, encoder_state = model_helper.create_cudnn_rnn(hparams.unit_type, hparams.num_units, num_uni_layers, self.num_encoder_residual_layers,
+                                                                       hparams.forget_bias, hparams.dropout, self.mode, self.num_gpus, base_gpu=1,
+                                                                       sequence_length=iterator.source_sequence_length, bidirectional=False, inputs=bi_encoder_outputs)
 
         encoder_state = (bi_encoder_state[1],) + (
             (encoder_state,) if num_uni_layers == 1 else encoder_state)
@@ -177,6 +154,8 @@ class GNMTModel(attention_model.AttentionModel):
     attention_architecture = hparams.attention_architecture
     num_units = hparams.num_units
     beam_width = hparams.beam_width
+
+    print('self.num_decoder_layers', self.num_decoder_layers)
 
     dtype = tf.float32
 
