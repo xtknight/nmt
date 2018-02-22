@@ -23,6 +23,7 @@ import abc
 import tensorflow as tf
 
 from tensorflow.python.layers import core as layers_core
+from tensorflow.contrib.cudnn_rnn.python.layers import cudnn_rnn
 
 from . import model_helper
 from .utils import iterator_utils
@@ -255,6 +256,7 @@ class BaseModel(object):
 
   def train(self, sess):
     assert self.mode == tf.contrib.learn.ModeKeys.TRAIN
+
     return sess.run([self.update,
                      self.train_loss,
                      self.predict_count,
@@ -330,6 +332,8 @@ class BaseModel(object):
                           base_gpu=0):
     """Build a multi-layer RNN cell that can be used by encoder."""
 
+    print('model::_build_encoder_cell')
+
     return model_helper.create_rnn_cell(
         unit_type=hparams.unit_type,
         num_units=hparams.num_units,
@@ -367,6 +371,8 @@ class BaseModel(object):
       A tuple of final logits and final decoder state:
         logits: size [time, batch_size, vocab_size] when time_major=True.
     """
+    print('model::_build_decoder')
+
     tgt_sos_id = tf.cast(self.tgt_vocab_table.lookup(tf.constant(hparams.sos)),
                          tf.int32)
     tgt_eos_id = tf.cast(self.tgt_vocab_table.lookup(tf.constant(hparams.eos)),
@@ -628,26 +634,86 @@ class Model(BaseModel):
       The concatenated bidirectional output and the bidirectional RNN cell"s
       state.
     """
-    # Construct forward and backward cells
-    fw_cell = self._build_encoder_cell(hparams,
-                                       num_bi_layers,
-                                       num_bi_residual_layers,
-                                       base_gpu=base_gpu)
-    bw_cell = self._build_encoder_cell(hparams,
-                                       num_bi_layers,
-                                       num_bi_residual_layers,
-                                       base_gpu=(base_gpu + num_bi_layers))
 
-    bi_outputs, bi_state = tf.nn.bidirectional_dynamic_rnn(
-        fw_cell,
-        bw_cell,
-        inputs,
-        dtype=dtype,
-        sequence_length=sequence_length,
-        time_major=self.time_major,
-        swap_memory=True)
+    print('model::_build_bidirectional_rnn')
 
-    return tf.concat(bi_outputs, -1), bi_state
+    if 'cudnn' in hparams.unit_type:
+      assert hparams.unit_type == 'cudnnlstm'
+      assert hparams.time_major == True
+
+      ## TODO: ensure time major
+      ## TODO: residual layers
+      ## TODO: multi gpu
+      ## TODO: is_training
+
+      cudnn_cell = cudnn_rnn.CudnnLSTM(num_layers=num_bi_layers,
+                                       num_units=hparams.num_units,
+                                       direction=cudnn_rnn.CUDNN_RNN_BIDIRECTION,
+                                       input_mode=cudnn_rnn.CUDNN_INPUT_LINEAR_MODE,
+                                       #input_size=hparams.num_units,
+                                       dtype=tf.float32)
+
+      ## TODO: fix scopes?
+      #self.init_h = tf.get_variable('h', dtype=tf.float32, initializer=tf.zeros([2*num_bi_layers, hparams.batch_size, hparams.num_units]))
+      #self.init_c = tf.get_variable('c', dtype=tf.float32, initializer=tf.zeros([2*num_bi_layers, hparams.batch_size, hparams.num_units]))
+
+      # FIXME: tweak init_scale
+      #params_size_t = cudnn_cell.params_size()
+
+      #cudnn_params = tf.get_variable('lstm_params',
+      #         initializer=tf.random_uniform([params_size_t], -0.04, 0.04), validate_shape=False)
+
+      print('inputs', inputs)
+
+      print('cudnn cell 1')
+      outputs, (h, c) = cudnn_cell(
+          inputs=inputs # 3-D tensor [time_len, batch_size, input_size],
+          #initial_state=(self.init_h, self.init_c),
+          #input_h=self.init_h,
+          #input_c=self.init_c#,
+          #params=cudnn_params #,
+          #is_training=is_training
+      )
+      print('cudnn cell 2')
+
+      print('cudnnlstm state h', h)
+      print('cudnnlstm state c', c)
+
+      #return tf.concat(outputs, -1), (h, c)
+      #cudnnlstm state h Tensor("dynamic_seq2seq/encoder/cudnn_lstm/CudnnRNN:1", shape=(2, ?, 1024), dtype=float32)
+      #cudnnlstm state c Tensor("dynamic_seq2seq/encoder/cudnn_lstm/CudnnRNN:2", shape=(2, ?, 1024), dtype=float32)
+      #LSTMStateTuple(c=c[0], h=h[0]), LSTMStateTuple(c=c[1], h=h[1])
+
+      print('unstack h', tf.unstack(h))
+      print('unstack c', tf.unstack(c))
+
+      h0, h1 = tf.unstack(h)
+      c0, c1 = tf.unstack(c)
+
+      return outputs, (tf.contrib.rnn.LSTMStateTuple(c=c0, h=h0), tf.contrib.rnn.LSTMStateTuple(c=c1, h=h1))
+    else:
+      #   Construct forward and backward cells
+      fw_cell = self._build_encoder_cell(hparams,
+                                         num_bi_layers,
+                                         num_bi_residual_layers,
+                                         base_gpu=base_gpu)
+      bw_cell = self._build_encoder_cell(hparams,
+                                         num_bi_layers,
+                                         num_bi_residual_layers,
+                                         base_gpu=(base_gpu + num_bi_layers))
+
+      bi_outputs, bi_state = tf.nn.bidirectional_dynamic_rnn(
+          fw_cell,
+          bw_cell,
+          inputs,
+          dtype=dtype,
+          sequence_length=sequence_length,
+          time_major=self.time_major,
+          swap_memory=True)
+
+      print('normal state', bi_state)
+
+      return tf.concat(bi_outputs, -1), bi_state
 
   def _build_decoder_cell(self, hparams, encoder_outputs, encoder_state,
                           source_sequence_length):

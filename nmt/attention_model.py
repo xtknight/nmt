@@ -66,12 +66,17 @@ class AttentionModel(model.Model):
   def _build_decoder_cell(self, hparams, encoder_outputs, encoder_state,
                           source_sequence_length):
     """Build a RNN cell with attention mechanism that can be used by decoder."""
+    print('attention_model::_build_decoder_cell', hparams)
+
     attention_option = hparams.attention
     attention_architecture = hparams.attention_architecture
 
     if attention_architecture != "standard":
       raise ValueError(
           "Unknown attention architecture %s" % attention_architecture)
+
+    if 'cudnn' in hparams.unit_type:
+      assert self.time_major, 'Cudnn unit types must use time-major'
 
     num_units = hparams.num_units
     num_layers = self.num_decoder_layers

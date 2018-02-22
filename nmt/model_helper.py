@@ -372,6 +372,8 @@ def _single_cell(unit_type, num_units, forget_bias, dropout, mode,
   elif unit_type == "nas":
     utils.print_out("  NASCell", new_line=False)
     single_cell = tf.contrib.rnn.NASCell(num_units)
+  elif unit_type == "cudnnlstm" or unit_type == "compat":
+    single_cell = tf.contrib.cudnn_rnn.CudnnCompatibleLSTMCell(num_units)
   else:
     raise ValueError("Unknown unit type %s!" % unit_type)
 
@@ -450,21 +452,30 @@ def create_rnn_cell(unit_type, num_units, num_layers, num_residual_layers,
   Returns:
     An `RNNCell` instance.
   """
-  cell_list = _cell_list(unit_type=unit_type,
-                         num_units=num_units,
-                         num_layers=num_layers,
-                         num_residual_layers=num_residual_layers,
-                         forget_bias=forget_bias,
-                         dropout=dropout,
-                         mode=mode,
-                         num_gpus=num_gpus,
-                         base_gpu=base_gpu,
-                         single_cell_fn=single_cell_fn)
 
-  if len(cell_list) == 1:  # Single layer.
-    return cell_list[0]
-  else:  # Multi layers
-    return tf.contrib.rnn.MultiRNNCell(cell_list)
+  print('model_helper::create_rnn_cell')
+
+  if 'cudnn' in unit_type:
+    assert unit_type == 'cudnnlstm'
+
+    if unit_type == 'cudnnlstm':
+      pass
+  else:
+    cell_list = _cell_list(unit_type=unit_type,
+                           num_units=num_units,
+                           num_layers=num_layers,
+                           num_residual_layers=num_residual_layers,
+                           forget_bias=forget_bias,
+                           dropout=dropout,
+                           mode=mode,
+                           num_gpus=num_gpus,
+                           base_gpu=base_gpu,
+                           single_cell_fn=single_cell_fn)
+
+    if len(cell_list) == 1:  # Single layer.
+      return cell_list[0]
+    else:  # Multi layers
+      return tf.contrib.rnn.MultiRNNCell(cell_list)
 
 
 def gradient_clip(gradients, max_gradient_norm):
