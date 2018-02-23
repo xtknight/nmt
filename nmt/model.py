@@ -383,6 +383,11 @@ class BaseModel(object):
     maximum_iterations = self._get_infer_maximum_iterations(
         hparams, iterator.source_sequence_length)
 
+    ## TODO: implement Cudnn-compatible dot-product attention
+    ##       which only looks at output and not hidden states at each step
+    ## https://github.com/OpenNMT/OpenNMT-py/blob/master/onmt/modules/GlobalAttention.py
+    ## https://github.com/MaximumEntropy/Seq2Seq-PyTorch
+
     ## Decoder.
     with tf.variable_scope("decoder") as decoder_scope:
       cell, decoder_initial_state = self._build_decoder_cell(
@@ -673,6 +678,8 @@ class Model(BaseModel):
     # We only make use of encoder_outputs in attention-based models
     if hparams.attention:
       raise ValueError("BasicModel doesn't support attention.")
+
+    assert 'cudnn' not in hparams.unit_type, 'TODO: implement'
 
     cell = model_helper.create_rnn_cell(
         unit_type=hparams.unit_type,
